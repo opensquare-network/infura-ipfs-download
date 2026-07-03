@@ -35,6 +35,7 @@ const AUTH = Buffer.from(`${PROJECT_ID}:${PROJECT_SECRET}`).toString('base64');
 async function infuraApi(endpoint, options = {}) {
   const url = `${INFURA_IPFS_API}${endpoint}`;
   const res = await fetch(url, {
+    method: 'POST',
     ...options,
     headers: {
       Authorization: `Basic ${AUTH}`,
