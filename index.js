@@ -54,21 +54,53 @@ async function infuraApi(endpoint, options = {}) {
 }
 
 /**
- * Fetch all pinned CIDs from the project.
+ * Fetch all pinned CIDs from the project using streaming.
  * Returns an array of { cid, type } objects.
  */
 async function fetchPinnedCIDs() {
   console.log('📋 Fetching pinned CIDs from Infura...');
-  const res = await infuraApi('/pin/ls');
-  const data = await res.json();
-  const keys = data.Keys || {};
 
-  const entries = Object.entries(keys).map(([cid, info]) => ({
-    cid,
-    type: info.Type, // "recursive", "direct", etc.
-  }));
+  const res = await infuraApi('/pin/ls?stream=true');
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const entries = [];
 
-  console.log(`   Found ${entries.length} pinned CID(s)\n`);
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    // Keep the last (potentially incomplete) chunk in the buffer
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const data = JSON.parse(line);
+        // Each streamed line is an object keyed by CID
+        for (const [cid, info] of Object.entries(data)) {
+          entries.push({ cid, type: info.Type });
+        }
+      } catch {
+        // Skip malformed lines
+      }
+    }
+    process.stdout.write(`\r   Found ${entries.length} pinned CID(s)...`);
+  }
+
+  // Flush remaining buffer
+  if (buffer.trim()) {
+    try {
+      const data = JSON.parse(buffer);
+      for (const [cid, info] of Object.entries(data)) {
+        entries.push({ cid, type: info.Type });
+      }
+    } catch { /* skip */ }
+  }
+
+  console.log(`\r   Found ${entries.length} pinned CID(s)    \n`);
   return entries;
 }
 
