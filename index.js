@@ -23,7 +23,7 @@ if (!PROJECT_ID || !PROJECT_SECRET) {
 }
 
 const INFURA_IPFS_API = 'https://ipfs.infura.io:5001/api/v0';
-const INFURA_IPFS_GATEWAY = 'https://ipfs.infura.io/ipfs';
+const INFURA_IPFS_GATEWAY = process.env.IPFS_ENDPOINT || 'https://ipfs.infura.io/ipfs';
 const AUTH = Buffer.from(`${PROJECT_ID}:${PROJECT_SECRET}`).toString('base64');
 const CONCURRENCY = parseInt(process.env.CONCURRENCY, 10) || 3;
 
