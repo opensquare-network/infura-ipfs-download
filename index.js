@@ -80,9 +80,21 @@ async function fetchPinnedCIDs() {
       if (!line.trim()) continue;
       try {
         const data = JSON.parse(line);
-        // Each streamed line is an object keyed by CID
-        for (const [cid, info] of Object.entries(data)) {
-          entries.push({ cid, type: info.Type });
+        // Stream format:    {"Cid":"Qm...","Type":"recursive"}
+        // Non-stream format: {"Keys":{"Qm...":{"Type":"recursive"}}}
+        if (data.Cid) {
+          entries.push({ cid: data.Cid, type: data.Type || 'unknown' });
+        } else if (data.Keys) {
+          for (const [cid, info] of Object.entries(data.Keys)) {
+            entries.push({ cid, type: info.Type });
+          }
+        } else {
+          // Fallback: iterate top-level keys
+          for (const [key, val] of Object.entries(data)) {
+            if (key !== 'Type' && typeof val === 'object' && val.Type) {
+              entries.push({ cid: key, type: val.Type });
+            }
+          }
         }
       } catch {
         // Skip malformed lines
@@ -95,8 +107,12 @@ async function fetchPinnedCIDs() {
   if (buffer.trim()) {
     try {
       const data = JSON.parse(buffer);
-      for (const [cid, info] of Object.entries(data)) {
-        entries.push({ cid, type: info.Type });
+      if (data.Cid) {
+        entries.push({ cid: data.Cid, type: data.Type || 'unknown' });
+      } else if (data.Keys) {
+        for (const [cid, info] of Object.entries(data.Keys)) {
+          entries.push({ cid, type: info.Type });
+        }
       }
     } catch { /* skip */ }
   }
