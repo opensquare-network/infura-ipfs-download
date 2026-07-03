@@ -123,7 +123,6 @@ async function fetchPinnedCIDs() {
 
 /**
  * Download a single CID via the Infura IPFS gateway and save it to disk.
- * File CIDs are saved directly; directory CIDs are saved as .tar via the API.
  */
 async function downloadCID({ cid, type }, index, total, downloadDir) {
   const prefix = `[${String(index + 1).padStart(String(total).length, '0')}/${total}]`;
@@ -131,42 +130,22 @@ async function downloadCID({ cid, type }, index, total, downloadDir) {
   try {
     console.log(`${prefix} ⬇️  Downloading ${cid} (${type})...`);
 
-    // Try gateway first — works reliably for individual files
-    let res = await fetch(`${INFURA_IPFS_GATEWAY}/${cid}`, {
+    const res = await fetch(`${INFURA_IPFS_GATEWAY}/${cid}`, {
       headers: { Authorization: `Basic ${AUTH}` },
     });
 
-    // If gateway returns HTML (directory listing) or fails, fall back to API /get
-    const contentType = res.headers.get('content-type') || '';
-    const isDirectory = res.ok && contentType.includes('text/html');
-
-    if (!res.ok || isDirectory) {
-      if (isDirectory) {
-        console.log(`${prefix}    📁 Directory detected, fetching as tar...`);
-      }
-      res = await infuraApi(`/get?arg=${cid}`);
+    if (!res.ok) {
+      throw new Error(`Gateway returned ${res.status}`);
     }
 
     const buffer = Buffer.from(await res.arrayBuffer());
-
-    // Directories come back as tar archives — detect by magic bytes.
-    const isTar =
-      buffer.length >= 262 &&
-      buffer[257] === 0x75 &&
-      buffer[258] === 0x73 &&
-      buffer[259] === 0x74 &&
-      buffer[260] === 0x61 &&
-      buffer[261] === 0x72;
-
-    const ext = isTar ? '.tar' : '';
-    const filename = `${cid}${ext}`;
-    const filePath = path.join(downloadDir, filename);
+    const filePath = path.join(downloadDir, cid);
 
     fs.mkdirSync(downloadDir, { recursive: true });
     fs.writeFileSync(filePath, buffer);
 
     const sizeKB = (buffer.length / 1024).toFixed(1);
-    console.log(`${prefix} ✅ Saved: ${filename} (${sizeKB} KB)`);
+    console.log(`${prefix} ✅ Saved: ${cid} (${sizeKB} KB)`);
   } catch (err) {
     console.error(`${prefix} ❌ Failed: ${cid} — ${err.message}`);
   }
