@@ -23,6 +23,7 @@ if (!PROJECT_ID || !PROJECT_SECRET) {
 }
 
 const INFURA_IPFS_API = 'https://ipfs.infura.io:5001/api/v0';
+const INFURA_IPFS_GATEWAY = 'https://ipfs.infura.io/ipfs';
 const AUTH = Buffer.from(`${PROJECT_ID}:${PROJECT_SECRET}`).toString('base64');
 
 // ---------------------------------------------------------------------------
@@ -105,9 +106,8 @@ async function fetchPinnedCIDs() {
 }
 
 /**
- * Download a single CID and save it to disk.
- * Directories are returned as tar archives — we save them with a .tar extension
- * so they are easy to extract.
+ * Download a single CID via the Infura IPFS gateway and save it to disk.
+ * File CIDs are saved directly; directory CIDs are saved as .tar via the API.
  */
 async function downloadCID({ cid, type }, index, total, downloadDir) {
   const prefix = `[${String(index + 1).padStart(String(total).length, '0')}/${total}]`;
@@ -115,11 +115,25 @@ async function downloadCID({ cid, type }, index, total, downloadDir) {
   try {
     console.log(`${prefix} ⬇️  Downloading ${cid} (${type})...`);
 
-    const res = await infuraApi(`/get?arg=${cid}`);
+    // Try gateway first — works reliably for individual files
+    let res = await fetch(`${INFURA_IPFS_GATEWAY}/${cid}`, {
+      headers: { Authorization: `Basic ${AUTH}` },
+    });
+
+    // If gateway returns HTML (directory listing) or fails, fall back to API /get
+    const contentType = res.headers.get('content-type') || '';
+    const isDirectory = res.ok && contentType.includes('text/html');
+
+    if (!res.ok || isDirectory) {
+      if (isDirectory) {
+        console.log(`${prefix}    📁 Directory detected, fetching as tar...`);
+      }
+      res = await infuraApi(`/get?arg=${cid}`);
+    }
+
     const buffer = Buffer.from(await res.arrayBuffer());
 
-    // Directories come back as tar archives; individual files are raw bytes.
-    // We peek at the magic bytes to decide the extension.
+    // Directories come back as tar archives — detect by magic bytes.
     const isTar =
       buffer.length >= 262 &&
       buffer[257] === 0x75 &&
