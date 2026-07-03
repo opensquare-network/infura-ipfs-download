@@ -25,6 +25,7 @@ if (!PROJECT_ID || !PROJECT_SECRET) {
 const INFURA_IPFS_API = 'https://ipfs.infura.io:5001/api/v0';
 const INFURA_IPFS_GATEWAY = 'https://ipfs.infura.io/ipfs';
 const AUTH = Buffer.from(`${PROJECT_ID}:${PROJECT_SECRET}`).toString('base64');
+const CONCURRENCY = parseInt(process.env.CONCURRENCY, 10) || 3;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -122,32 +123,27 @@ async function fetchPinnedCIDs() {
 }
 
 /**
- * Download a single CID via the Infura IPFS gateway and save it to disk.
+ * Download a single CID via the Infura IPFS gateway.
+ * Returns { ok: true } or { ok: false, error }.
  */
-async function downloadCID({ cid, type }, index, total, downloadDir) {
-  const prefix = `[${String(index + 1).padStart(String(total).length, '0')}/${total}]`;
-
+async function downloadCID(cid, downloadDir) {
   try {
-    console.log(`${prefix} ⬇️  Downloading ${cid} (${type})...`);
-
     const res = await fetch(`${INFURA_IPFS_GATEWAY}/${cid}`, {
       headers: { Authorization: `Basic ${AUTH}` },
     });
 
     if (!res.ok) {
-      throw new Error(`Gateway returned ${res.status}`);
+      return { ok: false, error: `Gateway returned ${res.status}` };
     }
 
     const buffer = Buffer.from(await res.arrayBuffer());
     const filePath = path.join(downloadDir, cid);
-
-    fs.mkdirSync(downloadDir, { recursive: true });
     fs.writeFileSync(filePath, buffer);
 
     const sizeKB = (buffer.length / 1024).toFixed(1);
-    console.log(`${prefix} ✅ Saved: ${cid} (${sizeKB} KB)`);
+    return { ok: true, cid, sizeKB };
   } catch (err) {
-    console.error(`${prefix} ❌ Failed: ${cid} — ${err.message}`);
+    return { ok: false, error: err.message };
   }
 }
 
@@ -160,8 +156,9 @@ async function main() {
   const downloadDir = path.join(__dirname, 'downloads', projectName);
 
   console.log(`🚀 Infura IPFS Downloader`);
-  console.log(`   Project:  ${projectName} (${PROJECT_ID})`);
-  console.log(`   Output:   ${downloadDir}\n`);
+  console.log(`   Project:     ${projectName} (${PROJECT_ID})`);
+  console.log(`   Output:      ${downloadDir}`);
+  console.log(`   Concurrency: ${CONCURRENCY}\n`);
 
   const pins = await fetchPinnedCIDs();
 
@@ -170,12 +167,62 @@ async function main() {
     return;
   }
 
-  // Download sequentially to avoid hammering the API
-  for (let i = 0; i < pins.length; i++) {
-    await downloadCID(pins[i], i, pins.length, downloadDir);
+  fs.mkdirSync(downloadDir, { recursive: true });
+
+  // Resume: skip CIDs already on disk
+  const toDownload = [];
+  let skipped = 0;
+  for (const { cid } of pins) {
+    if (fs.existsSync(path.join(downloadDir, cid))) {
+      skipped++;
+    } else {
+      toDownload.push(cid);
+    }
+  }
+  if (skipped > 0) {
+    console.log(`⏭️  ${skipped} already downloaded, ${toDownload.length} remaining\n`);
   }
 
-  console.log(`\n🎉 Done! Files saved to: ${downloadDir}`);
+  if (toDownload.length === 0) {
+    console.log('✨ All files already downloaded.');
+    return;
+  }
+
+  // Download in batches
+  let done = 0;
+  let failed = 0;
+  const total = toDownload.length;
+  const width = String(total).length;
+
+  for (let i = 0; i < toDownload.length; i += CONCURRENCY) {
+    const batch = toDownload.slice(i, i + CONCURRENCY);
+    const results = await Promise.allSettled(
+      batch.map((cid) => downloadCID(cid, downloadDir)),
+    );
+
+    for (const r of results) {
+      done++;
+      const prefix = `[${String(done).padStart(width, '0')}/${total}]`;
+      if (r.status === 'rejected') {
+        failed++;
+        console.error(`${prefix} ❌ Failed: ${r.reason?.message || r.reason}`);
+      } else if (r.value.ok) {
+        console.log(`${prefix} ✅ ${r.value.cid} (${r.value.sizeKB} KB)`);
+      } else {
+        failed++;
+        console.error(`${prefix} ❌ Failed: ${r.value.error}`);
+      }
+    }
+
+    // Brief pause between batches
+    if (i + CONCURRENCY < toDownload.length) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  console.log(
+    `\n🎉 Done! ${total - failed} succeeded, ${failed} failed, ${skipped} skipped. Files in: ${downloadDir}`,
+  );
 }
 
 main().catch((err) => {
