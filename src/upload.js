@@ -189,7 +189,11 @@ async function checkExistingKeys(s3Client, bucket, cids) {
 
   if (cids.length === 0) return existing;
 
-  process.stdout.write(`🔍 Checking R2 for ${cids.length} key(s)...`);
+  const total = cids.length;
+  const width = String(total).length;
+  let checked = 0;
+
+  console.log(`🔍 Checking R2 for ${total} key(s)...`);
 
   for (let i = 0; i < cids.length; i += CONCURRENCY) {
     const batch = cids.slice(i, i + CONCURRENCY);
@@ -211,13 +215,17 @@ async function checkExistingKeys(s3Client, bucket, cids) {
     );
 
     for (const r of results) {
+      checked++;
       if (r.status === 'fulfilled' && r.value) {
         existing.add(r.value);
       }
     }
+
+    const prefix = `[${String(checked).padStart(width, '0')}/${total}]`;
+    console.log(`${prefix} 🔍 Checked ${checked} keys — ${existing.size} already in R2, ${checked - existing.size} new`);
   }
 
-  process.stdout.write(`\r🔍 Checking R2 for ${cids.length} key(s)... ${existing.size} already exist\n`);
+  console.log('');
   return existing;
 }
 
