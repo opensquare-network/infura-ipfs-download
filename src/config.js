@@ -27,3 +27,28 @@ export const INFURA_IPFS_GATEWAY =
 
 export const CONCURRENCY =
   parseInt(process.env.CONCURRENCY, 10) || 3;
+
+// --- Cloudflare R2 ---
+export const R2_ENDPOINT = process.env.R2_ENDPOINT;
+export const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID;
+export const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY;
+export const R2_BUCKET = process.env.R2_BUCKET;
+export const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL || '';
+
+export function validateR2Config() {
+  const missing = [];
+  if (!R2_ENDPOINT) missing.push('R2_ENDPOINT');
+  if (!R2_ACCESS_KEY_ID) missing.push('R2_ACCESS_KEY_ID');
+  if (!R2_SECRET_ACCESS_KEY) missing.push('R2_SECRET_ACCESS_KEY');
+  if (!R2_BUCKET) missing.push('R2_BUCKET');
+  if (missing.length > 0) {
+    console.error(
+      '❌ Missing required R2 environment variables.\n' +
+        '   Copy .env.example to .env and fill in your Cloudflare R2 credentials:',
+    );
+    for (const m of missing) {
+      console.error(`   ${m}=xxxxxxxx`);
+    }
+    process.exit(1);
+  }
+}

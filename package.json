@@ -4,9 +4,12 @@
   "description": "Download all pinned CIDs from Infura IPFS",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "upload": "node upload.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.7"
+    "@aws-sdk/client-s3": "^3.1081.0",
+    "dotenv": "^16.4.7",
+    "file-type": "^22.0.1"
   }
 }
