@@ -13,19 +13,130 @@ import {
 } from './config.js';
 
 /**
- * Detect the MIME type of a file by reading its magic bytes.
- * Falls back to application/octet-stream when detection fails.
+ * Heuristic: does the buffer look like valid UTF-8 text?
+ * Uses TextDecoder with fatal=false and checks for replacement characters.
+ */
+function isUtf8Text(buffer) {
+  // Sample up to 16 KB for performance on large files
+  const sample = buffer.subarray(0, 16384);
+  try {
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(sample);
+    // If fatal decoding succeeds, it's valid UTF-8.
+    // Reject if the result is mostly null bytes (binary).
+    let nullCount = 0;
+    for (let i = 0; i < Math.min(decoded.length, 512); i++) {
+      if (decoded.charCodeAt(i) === 0) nullCount++;
+    }
+    return nullCount < 10;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detect text content MIME type from a UTF-8 string.
+ */
+function detectTextType(text) {
+  const trimmed = text.trimStart();
+
+  // JSON
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      JSON.parse(trimmed);
+      return 'application/json';
+    } catch {
+      // not valid JSON, treat as plain text
+    }
+  }
+
+  // HTML
+  if (/^<!DOCTYPE\s+html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed)) {
+    return 'text/html';
+  }
+
+  // SVG (can be inline in HTML, check before generic XML)
+  if (/^<svg[\s>]/i.test(trimmed) || /^<\?xml[^?]*\?>\s*<svg[\s>]/i.test(trimmed)) {
+    return 'image/svg+xml';
+  }
+
+  // XML
+  if (trimmed.startsWith('<?xml')) {
+    return 'application/xml';
+  }
+
+  // CSV (simple heuristic: first few lines all have the same number of commas)
+  if (trimmed.includes(',') || trimmed.includes('\t')) {
+    const lines = trimmed.split('\n').slice(0, 5).filter((l) => l.trim());
+    if (lines.length >= 2) {
+      const commaCounts = lines.map((l) => (l.match(/,/g) || []).length);
+      const tabCounts = lines.map((l) => (l.match(/\t/g) || []).length);
+      const allSameCommas = commaCounts.every((c) => c === commaCounts[0] && c > 0);
+      const allSameTabs = tabCounts.every((c) => c === tabCounts[0] && c > 0);
+      if (allSameCommas) return 'text/csv';
+      if (allSameTabs) return 'text/tab-separated-values';
+    }
+  }
+
+  // CSS
+  if (/\b(@media|@import|@charset|@keyframes|@font-face)\b/.test(trimmed.slice(0, 500))
+      || /\{[^}]*\}/.test(trimmed.slice(0, 500))) {
+    return 'text/css';
+  }
+
+  // JavaScript / TypeScript (check after JSON since JS can start with {)
+  if (/\b(const|let|var|function|import|export|require|module\.exports)\b/.test(trimmed.slice(0, 500))) {
+    return 'text/javascript';
+  }
+
+  // Markdown
+  if (/^#{1,6}\s/.test(trimmed) || /^[*+-]\s/.test(trimmed) || /\[.*\]\(.*\)/.test(trimmed)) {
+    return 'text/markdown';
+  }
+
+  // YAML
+  if (/^[\w-]+\s*:\s/.test(trimmed) && !trimmed.startsWith('{')) {
+    return 'text/yaml';
+  }
+
+  // Default text
+  return 'text/plain';
+}
+
+/**
+ * Detect the MIME type of a file.
+ * 1. Try magic-byte detection (binary formats: images, video, audio, pdf, etc.)
+ * 2. If not detected, check if it's valid UTF-8 text and apply heuristics.
+ * 3. Fall back to application/octet-stream.
  * Returns { mime, ext } with ext possibly null.
  */
 async function detectFileType(filePath) {
+  // Step 1: magic-byte detection for binary formats
   try {
     const result = await fileTypeFromFile(filePath);
     if (result) {
       return { mime: result.mime, ext: result.ext };
     }
   } catch {
-    // if detection fails for any reason, fall through to default
+    // continue to text detection
   }
+
+  // Step 2: read sample and check for UTF-8 text
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    const sample = Buffer.alloc(16384);
+    const bytesRead = fs.readSync(fd, sample, 0, 16384, 0);
+    fs.closeSync(fd);
+    const buffer = sample.subarray(0, bytesRead);
+
+    if (isUtf8Text(buffer)) {
+      const text = new TextDecoder('utf-8').decode(buffer);
+      return { mime: detectTextType(text), ext: null };
+    }
+  } catch {
+    // fall through
+  }
+
+  // Step 3: unknown binary
   return { mime: 'application/octet-stream', ext: null };
 }
 
