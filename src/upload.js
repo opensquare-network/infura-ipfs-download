@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, HeadObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { fileTypeFromFile } from 'file-type';
 import {
   R2_ENDPOINT,
@@ -180,8 +180,51 @@ async function uploadFile(s3Client, bucket, filePath, cid) {
 }
 
 /**
+ * Check which CIDs already exist in the R2 bucket.
+ * Uses HeadObject (lightweight) concurrently, respecting CONCURRENCY.
+ * Returns a Set of existing CIDs.
+ */
+async function checkExistingKeys(s3Client, bucket, cids) {
+  const existing = new Set();
+
+  if (cids.length === 0) return existing;
+
+  process.stdout.write(`🔍 Checking R2 for ${cids.length} key(s)...`);
+
+  for (let i = 0; i < cids.length; i += CONCURRENCY) {
+    const batch = cids.slice(i, i + CONCURRENCY);
+    const results = await Promise.allSettled(
+      batch.map(async (cid) => {
+        try {
+          await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: cid }));
+          return cid; // exists
+        } catch (err) {
+          // NotFound means the object doesn't exist — that's expected for new files
+          if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404) {
+            return null;
+          }
+          // Other errors (network, auth, etc.) — treat as "not found" to be safe
+          // and let the upload attempt catch real issues
+          return null;
+        }
+      }),
+    );
+
+    for (const r of results) {
+      if (r.status === 'fulfilled' && r.value) {
+        existing.add(r.value);
+      }
+    }
+  }
+
+  process.stdout.write(`\r🔍 Checking R2 for ${cids.length} key(s)... ${existing.size} already exist\n`);
+  return existing;
+}
+
+/**
  * Upload all files in a directory to Cloudflare R2.
- * Logs progress and returns { uploaded, failed } counts.
+ * Checks R2 first and skips files that already exist.
+ * Logs progress and returns { uploaded, failed, skipped } counts.
  */
 export async function uploadDirectory(dirPath) {
   validateR2Config();
@@ -198,20 +241,36 @@ export async function uploadDirectory(dirPath) {
 
   if (files.length === 0) {
     console.log('✨ No files found in directory. Nothing to upload.');
-    return { uploaded: 0, failed: 0 };
+    return { uploaded: 0, failed: 0, skipped: 0 };
   }
 
-  console.log(`📦 Uploading ${files.length} file(s) to R2 bucket "${R2_BUCKET}"...\n`);
-
   const s3Client = createS3Client();
-  const total = files.length;
+
+  // Pre-check: which files already exist in R2?
+  const existingKeys = await checkExistingKeys(s3Client, R2_BUCKET, files);
+  const toUpload = files.filter((cid) => !existingKeys.has(cid));
+  const skipped = existingKeys.size;
+
+  if (toUpload.length === 0) {
+    console.log(`✨ All ${files.length} file(s) already in R2. Nothing to upload.\n`);
+    if (R2_PUBLIC_URL) {
+      console.log(`   Public URL prefix: ${R2_PUBLIC_URL}/`);
+    }
+    return { uploaded: 0, failed: 0, skipped };
+  }
+
+  console.log(
+    `📦 ${skipped > 0 ? `${skipped} skipped, ` : ''}${toUpload.length} to upload → R2 bucket "${R2_BUCKET}"\n`,
+  );
+
+  const total = toUpload.length;
   const width = String(total).length;
   let done = 0;
   let uploaded = 0;
   let failed = 0;
 
-  for (let i = 0; i < files.length; i += CONCURRENCY) {
-    const batch = files.slice(i, i + CONCURRENCY);
+  for (let i = 0; i < toUpload.length; i += CONCURRENCY) {
+    const batch = toUpload.slice(i, i + CONCURRENCY);
     const results = await Promise.allSettled(
       batch.map((cid) => uploadFile(s3Client, R2_BUCKET, path.join(dirPath, cid), cid)),
     );
@@ -234,18 +293,18 @@ export async function uploadDirectory(dirPath) {
     }
 
     // Brief pause between batches
-    if (i + CONCURRENCY < files.length) {
+    if (i + CONCURRENCY < toUpload.length) {
       await new Promise((r) => setTimeout(r, 500));
     }
   }
 
   console.log(
-    `\n🎉 Upload complete! ${uploaded} succeeded, ${failed} failed.`,
+    `\n🎉 Upload complete! ${uploaded} succeeded, ${failed} failed, ${skipped} skipped.`,
   );
 
   if (R2_PUBLIC_URL) {
     console.log(`   Public URL prefix: ${R2_PUBLIC_URL}/`);
   }
 
-  return { uploaded, failed };
+  return { uploaded, failed, skipped };
 }
