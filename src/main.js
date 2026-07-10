@@ -15,28 +15,52 @@ export async function main() {
   console.log(`   Output:      ${downloadDir}`);
   console.log(`   Concurrency: ${CONCURRENCY}\n`);
 
-  const pins = await fetchPinnedCIDs();
+  const { pins, diagnostic } = await fetchPinnedCIDs();
 
   if (pins.length === 0) {
     console.log('✨ No pinned CIDs found. Nothing to download.');
+    if (diagnostic) console.log(`   ${diagnostic}`);
     return;
   }
 
   fs.mkdirSync(downloadDir, { recursive: true });
 
-  // Resume: skip CIDs already on disk
+  // Clean up any stale .tmp files from a previous interrupted run
+  for (const name of fs.readdirSync(downloadDir)) {
+    if (name.endsWith('.tmp')) {
+      const tmpPath = path.join(downloadDir, name);
+      console.log(`🧹 Cleaning up stale tmp file: ${name}`);
+      try { fs.unlinkSync(tmpPath); } catch {}
+    }
+  }
+
+  // Resume: skip CIDs that are already on disk AND non-empty
+  // A 0-byte file means a previous download was interrupted → re-download
   const toDownload = [];
   let skipped = 0;
+  let resumed = 0;
   for (const { cid } of pins) {
-    if (fs.existsSync(path.join(downloadDir, cid))) {
-      skipped++;
+    const filePath = path.join(downloadDir, cid);
+    if (fs.existsSync(filePath)) {
+      const stat = fs.statSync(filePath);
+      if (stat.size > 0) {
+        skipped++;
+      } else {
+        // Empty file — clean it up and re-download
+        fs.unlinkSync(filePath);
+        toDownload.push(cid);
+        resumed++;
+      }
     } else {
       toDownload.push(cid);
     }
   }
-  if (skipped > 0) {
+  if (skipped > 0 || resumed > 0) {
+    const parts = [];
+    if (skipped > 0) parts.push(`${skipped} already downloaded`);
+    if (resumed > 0) parts.push(`${resumed} partial file(s) re-downloading`);
     console.log(
-      `⏭️  ${skipped} already downloaded, ${toDownload.length} remaining\n`,
+      `⏭️  ${parts.join(', ')}, ${toDownload.length} remaining\n`,
     );
   }
 
@@ -80,6 +104,6 @@ export async function main() {
   }
 
   console.log(
-    `\n🎉 Done! ${total - failed} succeeded, ${failed} failed, ${skipped} skipped. Files in: ${downloadDir}`,
+    `\n🎉 Done! ${total - failed} succeeded, ${failed} failed, ${skipped} skipped (${resumed} resumed). Files in: ${downloadDir}`,
   );
 }

@@ -4,9 +4,13 @@ import { INFURA_IPFS_GATEWAY, AUTH } from './config.js';
 
 /**
  * Download a single CID via the Infura IPFS gateway.
+ * Writes atomically (tmp → rename) to avoid partial files on interruption.
  * Returns { ok: true, cid, sizeKB } or { ok: false, error }.
  */
 export async function downloadCID(cid, downloadDir) {
+  const filePath = path.join(downloadDir, cid);
+  const tmpPath = filePath + '.tmp';
+
   try {
     const res = await fetch(`${INFURA_IPFS_GATEWAY}/${cid}`, {
       headers: { Authorization: `Basic ${AUTH}` },
@@ -17,12 +21,20 @@ export async function downloadCID(cid, downloadDir) {
     }
 
     const buffer = Buffer.from(await res.arrayBuffer());
-    const filePath = path.join(downloadDir, cid);
-    fs.writeFileSync(filePath, buffer);
+
+    if (buffer.length === 0) {
+      return { ok: false, error: 'Empty response body' };
+    }
+
+    // Atomic write: write to tmp file first, then rename
+    fs.writeFileSync(tmpPath, buffer);
+    fs.renameSync(tmpPath, filePath);
 
     const sizeKB = (buffer.length / 1024).toFixed(1);
     return { ok: true, cid, sizeKB };
   } catch (err) {
+    // Clean up tmp file if it exists
+    try { fs.unlinkSync(tmpPath); } catch {}
     return { ok: false, error: err.message };
   }
 }
