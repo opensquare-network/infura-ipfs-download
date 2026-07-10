@@ -155,83 +155,51 @@ function createS3Client() {
 }
 
 /**
- * Upload a single file to R2 with auto-detected Content-Type.
- * Returns { cid, key, contentType, sizeBytes } on success.
+ * Check if a key exists in R2 (lightweight HEAD request).
+ * Returns true if the object exists, false otherwise.
  */
-async function uploadFile(s3Client, bucket, filePath, cid) {
+async function keyExists(s3Client, bucket, cid) {
+  try {
+    await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: cid }));
+    return true;
+  } catch (err) {
+    // NotFound → doesn't exist. Other errors → treat as not found to be safe.
+    return false;
+  }
+}
+
+/**
+ * Check-then-upload a single file: if it already exists in R2, skip it;
+ * otherwise detect type and upload. Returns result with action label.
+ */
+async function checkAndUploadFile(s3Client, bucket, filePath, cid) {
+  // Check first
+  if (await keyExists(s3Client, bucket, cid)) {
+    return { action: 'skip', cid };
+  }
+
+  // Not in R2 — upload
   const { mime } = await detectFileType(filePath);
   const fileBuffer = fs.readFileSync(filePath);
 
-  const command = new PutObjectCommand({
+  await s3Client.send(new PutObjectCommand({
     Bucket: bucket,
     Key: cid,
     Body: fileBuffer,
     ContentType: mime,
-  });
-
-  await s3Client.send(command);
+  }));
 
   return {
+    action: 'upload',
     cid,
-    key: cid,
     contentType: mime,
     sizeBytes: fileBuffer.length,
   };
 }
 
 /**
- * Check which CIDs already exist in the R2 bucket.
- * Uses HeadObject (lightweight) concurrently, respecting CONCURRENCY.
- * Returns a Set of existing CIDs.
- */
-async function checkExistingKeys(s3Client, bucket, cids) {
-  const existing = new Set();
-
-  if (cids.length === 0) return existing;
-
-  const total = cids.length;
-  const width = String(total).length;
-  let checked = 0;
-
-  console.log(`🔍 Checking R2 for ${total} key(s)...`);
-
-  for (let i = 0; i < cids.length; i += CONCURRENCY) {
-    const batch = cids.slice(i, i + CONCURRENCY);
-    const results = await Promise.allSettled(
-      batch.map(async (cid) => {
-        try {
-          await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: cid }));
-          return cid; // exists
-        } catch (err) {
-          // NotFound means the object doesn't exist — that's expected for new files
-          if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404) {
-            return null;
-          }
-          // Other errors (network, auth, etc.) — treat as "not found" to be safe
-          // and let the upload attempt catch real issues
-          return null;
-        }
-      }),
-    );
-
-    for (const r of results) {
-      checked++;
-      if (r.status === 'fulfilled' && r.value) {
-        existing.add(r.value);
-      }
-    }
-
-    const prefix = `[${String(checked).padStart(width, '0')}/${total}]`;
-    console.log(`${prefix} 🔍 Checked ${checked} keys — ${existing.size} already in R2, ${checked - existing.size} new`);
-  }
-
-  console.log('');
-  return existing;
-}
-
-/**
  * Upload all files in a directory to Cloudflare R2.
- * Checks R2 first and skips files that already exist.
+ * For each file: checks R2 first, skips if already present, uploads otherwise.
  * Logs progress and returns { uploaded, failed, skipped } counts.
  */
 export async function uploadDirectory(dirPath) {
@@ -252,35 +220,20 @@ export async function uploadDirectory(dirPath) {
     return { uploaded: 0, failed: 0, skipped: 0 };
   }
 
+  console.log(`📦 Processing ${files.length} file(s) → R2 bucket "${R2_BUCKET}"\n`);
+
   const s3Client = createS3Client();
-
-  // Pre-check: which files already exist in R2?
-  const existingKeys = await checkExistingKeys(s3Client, R2_BUCKET, files);
-  const toUpload = files.filter((cid) => !existingKeys.has(cid));
-  const skipped = existingKeys.size;
-
-  if (toUpload.length === 0) {
-    console.log(`✨ All ${files.length} file(s) already in R2. Nothing to upload.\n`);
-    if (R2_PUBLIC_URL) {
-      console.log(`   Public URL prefix: ${R2_PUBLIC_URL}/`);
-    }
-    return { uploaded: 0, failed: 0, skipped };
-  }
-
-  console.log(
-    `📦 ${skipped > 0 ? `${skipped} skipped, ` : ''}${toUpload.length} to upload → R2 bucket "${R2_BUCKET}"\n`,
-  );
-
-  const total = toUpload.length;
+  const total = files.length;
   const width = String(total).length;
   let done = 0;
   let uploaded = 0;
   let failed = 0;
+  let skipped = 0;
 
-  for (let i = 0; i < toUpload.length; i += CONCURRENCY) {
-    const batch = toUpload.slice(i, i + CONCURRENCY);
+  for (let i = 0; i < files.length; i += CONCURRENCY) {
+    const batch = files.slice(i, i + CONCURRENCY);
     const results = await Promise.allSettled(
-      batch.map((cid) => uploadFile(s3Client, R2_BUCKET, path.join(dirPath, cid), cid)),
+      batch.map((cid) => checkAndUploadFile(s3Client, R2_BUCKET, path.join(dirPath, cid), cid)),
     );
 
     for (const r of results) {
@@ -289,8 +242,11 @@ export async function uploadDirectory(dirPath) {
       if (r.status === 'rejected') {
         failed++;
         console.error(
-          `${prefix} ❌ Upload failed: ${r.reason?.message || r.reason}`,
+          `${prefix} ❌ Failed: ${r.reason?.message || r.reason}`,
         );
+      } else if (r.value.action === 'skip') {
+        skipped++;
+        console.log(`${prefix} ⏭️  ${r.value.cid} (already in R2)`);
       } else {
         uploaded++;
         const sizeKB = (r.value.sizeBytes / 1024).toFixed(1);
@@ -301,13 +257,13 @@ export async function uploadDirectory(dirPath) {
     }
 
     // Brief pause between batches
-    if (i + CONCURRENCY < toUpload.length) {
+    if (i + CONCURRENCY < files.length) {
       await new Promise((r) => setTimeout(r, 500));
     }
   }
 
   console.log(
-    `\n🎉 Upload complete! ${uploaded} succeeded, ${failed} failed, ${skipped} skipped.`,
+    `\n🎉 Done! ${uploaded} uploaded, ${skipped} skipped, ${failed} failed.`,
   );
 
   if (R2_PUBLIC_URL) {
