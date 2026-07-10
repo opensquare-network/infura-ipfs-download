@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { S3Client, HeadObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { fileTypeFromFile } from 'file-type';
+import { openDB, isUploaded, markUploaded, closeDB } from './db.js';
 import {
   R2_ENDPOINT,
   R2_ACCESS_KEY_ID,
@@ -155,30 +156,16 @@ function createS3Client() {
 }
 
 /**
- * Check if a key exists in R2 (lightweight HEAD request).
- * Returns true if the object exists, false otherwise.
+ * Check-then-upload a single file: if it's already recorded in the local DB, skip it;
+ * otherwise detect type and upload to R2. Returns result with action label.
  */
-async function keyExists(s3Client, bucket, cid) {
-  try {
-    await s3Client.send(new HeadObjectCommand({ Bucket: bucket, Key: cid }));
-    return true;
-  } catch (err) {
-    // NotFound → doesn't exist. Other errors → treat as not found to be safe.
-    return false;
-  }
-}
-
-/**
- * Check-then-upload a single file: if it already exists in R2, skip it;
- * otherwise detect type and upload. Returns result with action label.
- */
-async function checkAndUploadFile(s3Client, bucket, filePath, cid) {
-  // Check first
-  if (await keyExists(s3Client, bucket, cid)) {
+async function checkAndUploadFile(s3Client, bucket, db, filePath, cid) {
+  // Check local DB first — no network call
+  if (isUploaded(db, cid)) {
     return { action: 'skip', cid };
   }
 
-  // Not in R2 — upload
+  // Not yet uploaded — detect type and upload to R2
   const { mime } = await detectFileType(filePath);
   const fileBuffer = fs.readFileSync(filePath);
 
@@ -188,6 +175,9 @@ async function checkAndUploadFile(s3Client, bucket, filePath, cid) {
     Body: fileBuffer,
     ContentType: mime,
   }));
+
+  // Record in DB so we skip it next time
+  markUploaded(db, cid, mime, fileBuffer.length);
 
   return {
     action: 'upload',
@@ -199,7 +189,7 @@ async function checkAndUploadFile(s3Client, bucket, filePath, cid) {
 
 /**
  * Upload all files in a directory to Cloudflare R2.
- * For each file: checks R2 first, skips if already present, uploads otherwise.
+ * Uses a local SQLite DB to skip already-uploaded files (no network calls).
  * Logs progress and returns { uploaded, failed, skipped } counts.
  */
 export async function uploadDirectory(dirPath) {
@@ -220,9 +210,14 @@ export async function uploadDirectory(dirPath) {
     return { uploaded: 0, failed: 0, skipped: 0 };
   }
 
-  console.log(`📦 Processing ${files.length} file(s) → R2 bucket "${R2_BUCKET}"\n`);
+  // Open local tracking DB — lives at project-root/data/uploaded.db
+  const dbPath = path.join(dirPath, '..', '..', 'data', 'uploaded.db');
+  const db = openDB(dbPath);
 
   const s3Client = createS3Client();
+
+  console.log(`📦 Processing ${files.length} file(s) → R2 bucket "${R2_BUCKET}"\n`);
+
   const total = files.length;
   const width = String(total).length;
   let done = 0;
@@ -233,7 +228,7 @@ export async function uploadDirectory(dirPath) {
   for (let i = 0; i < files.length; i += CONCURRENCY) {
     const batch = files.slice(i, i + CONCURRENCY);
     const results = await Promise.allSettled(
-      batch.map((cid) => checkAndUploadFile(s3Client, R2_BUCKET, path.join(dirPath, cid), cid)),
+      batch.map((cid) => checkAndUploadFile(s3Client, R2_BUCKET, db, path.join(dirPath, cid), cid)),
     );
 
     for (const r of results) {
@@ -246,7 +241,7 @@ export async function uploadDirectory(dirPath) {
         );
       } else if (r.value.action === 'skip') {
         skipped++;
-        console.log(`${prefix} ⏭️  ${r.value.cid} (already in R2)`);
+        console.log(`${prefix} ⏭️  ${r.value.cid} (already uploaded)`);
       } else {
         uploaded++;
         const sizeKB = (r.value.sizeBytes / 1024).toFixed(1);
@@ -261,6 +256,8 @@ export async function uploadDirectory(dirPath) {
       await new Promise((r) => setTimeout(r, 500));
     }
   }
+
+  closeDB(db);
 
   console.log(
     `\n🎉 Done! ${uploaded} uploaded, ${skipped} skipped, ${failed} failed.`,
